@@ -11,11 +11,17 @@ export default function SectorChart({ sectors }: { sectors: SectorScore[] }) {
 
   const CustomTooltip = ({ active, payload }: any) => {
     if (active && payload && payload.length) {
+      const grounded = payload[0].payload.data_grounded
       return (
         <div className="bg-white border border-slate-200 shadow-lg rounded-lg px-3 py-2 text-sm">
           <p className="text-slate-900 font-semibold">{payload[0].payload.name}</p>
           <p className="text-slate-500">Score: <span className="text-slate-900 font-bold">{payload[0].value}</span></p>
           <p className="text-slate-500">Sentiment: <span className="text-slate-900 font-bold">{payload[0].payload.sentiment}</span></p>
+          {grounded !== undefined && (
+            <p className={`text-xs mt-1 font-medium ${grounded ? 'text-emerald-600' : 'text-amber-600'}`}>
+              {grounded ? '✓ Backed by real government data' : '⚠ AI-estimated (no dataset for this sector yet)'}
+            </p>
+          )}
         </div>
       )
     }

@@ -9,6 +9,8 @@ import docx
 from dotenv import load_dotenv
 from rag import build_rag, retrieve_chunks
 from datasets import get_sector_context
+from risk_engine import compute_risk_score
+from simulation import simulate_timeline
 
 load_dotenv()
 
@@ -23,6 +25,18 @@ app.add_middleware(
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+# All 28 Indian states (matches the paper's "all 28 states" claim — this used
+# to be a hardcoded example list of 7 states, so most of the map defaulted
+# to 0/no-data regardless of the policy).
+INDIAN_STATES = [
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka",
+    "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
+    "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan", "Sikkim",
+    "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand",
+    "West Bengal",
+]
+
 # ── Extract text from uploaded file ──
 def extract_text(file_bytes: bytes, filename: str) -> str:
     if filename.endswith(".pdf"):
@@ -35,7 +49,23 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
         return file_bytes.decode("utf-8")
 
 # ── Send RAG context to Groq for analysis ──
+#
+# IMPORTANT CHANGE: the LLM is no longer asked to invent the final
+# overall_risk_score directly. It's asked to estimate the four underlying
+# risk *dimensions* (severity, plausibility, magnitude, vulnerable
+# population) from the policy text, and the actual score is computed in
+# Python by risk_engine.compute_risk_score() using a fixed, documented
+# formula. This matches the abstract's claim that "the risk score is
+# assigned depending on the rules assigned to it" — previously that wasn't
+# true, the LLM was just outputting a number with no rule behind it.
+#
+# The timeline is also no longer LLM-invented — see simulate_timeline() in
+# simulation.py, called after this function returns.
 def analyse_with_groq(policy_text: str) -> dict:
+    states_list_example = ",\n    ".join(
+        f'{{"state": "{s}", "impact_score": 0}}' for s in INDIAN_STATES[:3]
+    )
+
     prompt = f"""
 You are a government policy analyst for India.
 
@@ -43,7 +73,12 @@ Analyse this policy document and return ONLY a JSON object with this exact struc
 
 {{
   "policy_title": "title of the policy",
-  "overall_risk_score": 65,
+  "risk_dimensions": {{
+    "severity": 65,
+    "plausibility": 60,
+    "magnitude": 70,
+    "vulnerable_population": 55
+  }},
   "sectors": [
     {{"name": "Agriculture", "score": 80, "sentiment": "negative"}},
     {{"name": "Economy", "score": 55, "sentiment": "neutral"}},
@@ -52,26 +87,14 @@ Analyse this policy document and return ONLY a JSON object with this exact struc
     {{"name": "Infrastructure", "score": 60, "sentiment": "negative"}}
   ],
   "states": [
-    {{"state": "Punjab", "impact_score": 90}},
-    {{"state": "Maharashtra", "impact_score": 65}},
-    {{"state": "Uttar Pradesh", "impact_score": 75}},
-    {{"state": "Tamil Nadu", "impact_score": 40}},
-    {{"state": "Kerala", "impact_score": 20}},
-    {{"state": "Gujarat", "impact_score": 55}},
-    {{"state": "Rajasthan", "impact_score": 70}}
+    {states_list_example},
+    ... one entry for EVERY state listed below ...
   ],
   "stakeholders": [
     {{"group": "Farmers", "impact": "describe impact here", "severity": "high"}},
     {{"group": "Urban Workers", "impact": "describe impact here", "severity": "medium"}},
     {{"group": "State Governments", "impact": "describe impact here", "severity": "high"}},
     {{"group": "Exporters", "impact": "describe impact here", "severity": "low"}}
-  ],
-  "timeline": [
-    {{"period": "6 months", "impact_score": 40, "description": "short description of impact at 6 months"}},
-    {{"period": "1 year", "impact_score": 55, "description": "short description of impact at 1 year"}},
-    {{"period": "2 years", "impact_score": 65, "description": "short description of impact at 2 years"}},
-    {{"period": "3 years", "impact_score": 72, "description": "short description of impact at 3 years"}},
-    {{"period": "5 years", "impact_score": 80, "description": "short description of impact at 5 years"}}
   ],
   "recommendations": [
     {{
@@ -102,44 +125,69 @@ Analyse this policy document and return ONLY a JSON object with this exact struc
 }}
 
 Score rules:
-- overall_risk_score: 0 to 100
+- risk_dimensions: each 0 to 100. These are the ONLY risk inputs you provide —
+  do NOT compute an overall score yourself, the backend computes it from these.
+  - severity: how bad are the negative side-effects if they occur?
+  - plausibility: how likely are those effects to actually happen?
+  - magnitude: how many people / how much of the economy is affected?
+  - vulnerable_population: how directly does it hit vulnerable groups?
 - sector scores: 0 to 100
 - sentiment: only "positive", "negative", or "neutral"
-- severity: only "high", "medium", or "low"
+- severity (stakeholders): only "high", "medium", or "low"
 - priority: only "high", "medium", or "low"
-- timeline impact_score: 0 to 100 (predicted impact growth over time)
+- states: include EVERY one of these {len(INDIAN_STATES)} states, each with an impact_score 0-100 based on the policy's relevance to that state: {", ".join(INDIAN_STATES)}
 - Give exactly 4 recommendations based on actual policy weaknesses
-- Use the RBI reference data to give accurate state-wise and sector-wise scores
+- Use the RBI reference data to give accurate state-wise and sector-wise scores where it's relevant; where no real dataset is provided for a sector, rely on the policy text itself and say so implicitly through a more moderate/neutral score rather than guessing confidently
 
 Policy document (relevant excerpts):
 {policy_text}
 """
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        max_tokens=2000,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a policy analyst. Always respond with valid JSON only. No markdown, no backticks, no extra text."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
+    return _call_groq_json(prompt, max_tokens=3200)
 
-    response_text = response.choices[0].message.content.strip()
-    if response_text.startswith("```"):
-        response_text = response_text.split("```")[1]
-        if response_text.startswith("json"):
-            response_text = response_text[4:]
 
-    try:
-        return json.loads(response_text)
-    except json.JSONDecodeError:
-        raise ValueError(f"Groq returned invalid JSON. Response was: {response_text[:200]}")
+def _call_groq_json(prompt: str, max_tokens: int = 2000, retries: int = 1) -> dict:
+    """Call Groq expecting a JSON object back. Retries once with a sharper
+    reminder if the first response isn't valid JSON, so a single flaky
+    generation doesn't crash the whole request (this matters live, on stage,
+    during a demo)."""
+    last_error = None
+    attempt_prompt = prompt
+
+    for attempt in range(retries + 1):
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a policy analyst. Always respond with valid JSON only. No markdown, no backticks, no extra text."
+                },
+                {
+                    "role": "user",
+                    "content": attempt_prompt
+                }
+            ]
+        )
+
+        response_text = response.choices[0].message.content.strip()
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError as e:
+            last_error = e
+            attempt_prompt = (
+                prompt
+                + "\n\nYour previous response was not valid JSON. "
+                  "Return ONLY the JSON object, with no markdown formatting, "
+                  "no backticks, and no explanation text before or after it."
+            )
+
+    raise ValueError(f"Groq returned invalid JSON after {retries + 1} attempts: {last_error}")
 
 
 # ── Route: Upload + Analyse ──
@@ -169,7 +217,7 @@ async def upload_policy(file: UploadFile = File(...)):
 
         # ── Check if it's actually a government policy ──
         check_response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             max_tokens=10,
             messages=[
                 {
@@ -197,7 +245,8 @@ async def upload_policy(file: UploadFile = File(...)):
         timeline_context = retrieve_chunks("timeline short term long term future impact years months", "policy")
 
         # ── Fetch real RBI dataset context ──
-        dataset_context = get_sector_context(["agriculture", "economy", "infrastructure", "healthcare", "education"])
+        sector_names = ["agriculture", "economy", "infrastructure", "healthcare", "education"]
+        dataset_context, data_grounded = get_sector_context(sector_names)
 
         rag_context = f"""
 SECTOR IMPACT CONTEXT (from policy):
@@ -217,6 +266,26 @@ REAL INDIA REFERENCE DATA (RBI Handbook of Statistics):
 """
 
         result = analyse_with_groq(rag_context)
+
+        # ── Compute the overall risk score with the rule-based engine ──
+        # (the LLM only supplied the four input dimensions above)
+        risk = compute_risk_score(result.get("risk_dimensions", {}))
+        result["overall_risk_score"] = risk["overall_risk_score"]
+        result["risk_level"] = risk["risk_level"]
+        result["risk_dimensions"] = risk["dimensions"]
+        result["score_explanation"] = risk["explanation"]
+
+        # ── Mark which sectors are backed by real government data vs
+        # AI-estimated only, so the dashboard can show an honest badge ──
+        for sector in result.get("sectors", []):
+            sector["data_grounded"] = data_grounded.get(sector.get("name", "").lower(), False)
+
+        # ── Compute the timeline with the lightweight agent-based
+        # simulation instead of letting the LLM invent it ──
+        result["timeline"] = simulate_timeline(
+            result["overall_risk_score"], result.get("stakeholders", [])
+        )
+
         result["id"] = "sim_001"
         return result
 
@@ -250,7 +319,7 @@ async def compare_policies(
         context2 = retrieve_chunks("sector economy agriculture healthcare infrastructure impact", "policy2")
 
         # ── Fetch real RBI dataset context for comparison ──
-        dataset_context = get_sector_context(["agriculture", "economy", "infrastructure", "healthcare", "education"])
+        dataset_context, _ = get_sector_context(["agriculture", "economy", "infrastructure", "healthcare", "education"])
 
         prompt = f"""
 You are a government policy analyst for India.
@@ -318,31 +387,7 @@ REAL INDIA REFERENCE DATA (RBI):
 {dataset_context}
 """
 
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=1500,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a policy analyst. Always respond with valid JSON only. No markdown, no backticks, no extra text."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        response_text = response.choices[0].message.content.strip()
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            raise ValueError(f"Groq returned invalid JSON. Response was: {response_text[:200]}")
+        return _call_groq_json(prompt, max_tokens=1500)
 
     except Exception as e:
         return {"error": str(e)}

@@ -2,6 +2,14 @@ export interface SectorScore {
   name: string
   score: number
   sentiment: 'positive' | 'negative' | 'neutral'
+  data_grounded?: boolean
+}
+
+export interface RiskDimensions {
+  severity: number
+  plausibility: number
+  magnitude: number
+  vulnerable_population: number
 }
 
 export interface StateImpact {
@@ -32,6 +40,9 @@ export interface SimulationResult {
   id: string
   policy_title: string
   overall_risk_score: number
+  risk_level?: 'High' | 'Medium' | 'Low'
+  risk_dimensions?: RiskDimensions
+  score_explanation?: string
   sectors: SectorScore[]
   states: StateImpact[]
   stakeholders: Stakeholder[]
