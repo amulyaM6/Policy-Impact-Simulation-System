@@ -10,6 +10,7 @@ import Recommendations from '@/components/Recommendations'
 import ExportButton from '@/components/ExportButton'
 import TimelineChart from '@/components/TimelineChart'
 import IndiaMap from '@/components/IndiaMap'
+import RiskBreakdown from '@/components/RiskBreakdown'
 
 export default function Dashboard() {
   const [data, setData] = useState<SimulationResult>(mockData)
@@ -63,7 +64,11 @@ export default function Dashboard() {
           </div>
         </div>
 
+        {/* Risk Score Breakdown */}
+        <RiskBreakdown dimensions={data.risk_dimensions} explanation={data.score_explanation} />
+
         {/* Timeline */}
+        
         {data.timeline && data.timeline.length > 0 && (
           <TimelineChart timeline={data.timeline} />
         )}
