@@ -11,11 +11,17 @@ DATASET_MAP = {
     "15T_": "agriculture_production",
     "17T_": "agriculture_commercial",
     "27T_": "infrastructure_industry",
+    "UDISE_": "education_udise",
+    "NFHS5_": "health_nfhs",
 }
 
 def get_dataset_sector(filename: str) -> str:
+    # Use startswith, not "in" — "5T_" is a substring of "15T_", so substring
+    # matching was silently misclassifying the agriculture_production file
+    # (15T_...) as economy_gdp, overwriting the real economy_gdp data. This
+    # broke both sectors at once without any visible error.
     for prefix, sector in DATASET_MAP.items():
-        if prefix in filename:
+        if filename.startswith(prefix):
             return sector
     return "general"
 
@@ -35,24 +41,29 @@ def load_all_datasets() -> dict:
         return datasets
 
     for filename in os.listdir(DATASETS_FOLDER):
+        filepath = os.path.join(DATASETS_FOLDER, filename)
+        sector = get_dataset_sector(filename)
+
         if filename.endswith(".pdf"):
-            filepath = os.path.join(DATASETS_FOLDER, filename)
-            sector = get_dataset_sector(filename)
             print(f"📂 Loading {sector} dataset from {filename}...")
             text = extract_pdf_text(filepath)
+            datasets[sector] = text
+            print(f"✅ Loaded {sector} — {len(text)} characters")
+        elif filename.endswith(".txt"):
+            print(f"📂 Loading {sector} dataset from {filename}...")
+            with open(filepath, "r", encoding="utf-8") as f:
+                text = f.read()
             datasets[sector] = text
             print(f"✅ Loaded {sector} — {len(text)} characters")
 
     return datasets
 
 # ── Format datasets into context string for RAG ──
-# NOTE: healthcare/education intentionally have NO real dataset behind them
-# yet (only RBI economy/agriculture/infrastructure PDFs are bundled). We do
-# NOT fall back to reusing economy data for them anymore — that was
-# misleading (it made healthcare/education look data-grounded when they
-# weren't). Instead we track and report which sectors are genuinely backed
-# by real data so the frontend can show an honest "AI-estimated" vs
-# "data-grounded" badge per sector.
+# education now has a real dataset (UDISE+ 2023-24, all states) — fully data_grounded.
+# healthcare has a REAL but PARTIAL dataset (NFHS-5, only 5 of 36 states/UTs covered so
+# far) — grounded only stays True here at the sector level; if you want per-state
+# accuracy on this, cross-check against the state list inside NFHS5_health_partial.txt
+# before trusting a specific state's healthcare number.
 def format_dataset_context(datasets: dict, query_sectors: list) -> tuple[str, dict]:
     context_parts = []
     grounded = {}
@@ -61,9 +72,8 @@ def format_dataset_context(datasets: dict, query_sectors: list) -> tuple[str, di
         "agriculture": ["agriculture_production", "agriculture_commercial"],
         "economy": ["economy_gdp", "economy_percapita"],
         "infrastructure": ["infrastructure_industry"],
-        # No real dataset available for these yet — see note above.
-        "healthcare": [],
-        "education": [],
+        "healthcare": ["health_nfhs"],
+        "education": ["education_udise"],
     }
 
     for query_sector in query_sectors:
@@ -71,7 +81,9 @@ def format_dataset_context(datasets: dict, query_sectors: list) -> tuple[str, di
         found_any = False
         for key in matched_keys:
             if key in datasets:
-                context_parts.append(f"\n=== INDIA {query_sector.upper()} DATA (RBI) ===\n{datasets[key][:1000]}")
+                source_label = "RBI" if key.startswith(("economy", "agriculture", "infrastructure")) else \
+                                "UDISE+" if key.startswith("education") else "NFHS-5"
+                context_parts.append(f"\n=== INDIA {query_sector.upper()} DATA ({source_label}) ===\n{datasets[key][:2500]}")
                 found_any = True
         grounded[query_sector.lower()] = found_any
 
