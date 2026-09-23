@@ -12,7 +12,9 @@ DATASET_MAP = {
     "17T_": "agriculture_commercial",
     "27T_": "infrastructure_industry",
     "UDISE_": "education_udise",
-    "NFHS5_": "health_nfhs",
+    "RBI_health_MPI": "health_mpi_all_states",
+    "NFHS5_": "health_nfhs_partial",
+    "NITI_Aayog_Health": "health_niti_index",
 }
 
 def get_dataset_sector(filename: str) -> str:
@@ -72,7 +74,7 @@ def format_dataset_context(datasets: dict, query_sectors: list) -> tuple[str, di
         "agriculture": ["agriculture_production", "agriculture_commercial"],
         "economy": ["economy_gdp", "economy_percapita"],
         "infrastructure": ["infrastructure_industry"],
-        "healthcare": ["health_nfhs"],
+        "healthcare": ["health_mpi_all_states", "health_niti_index", "health_nfhs_partial"],
         "education": ["education_udise"],
     }
 
@@ -82,7 +84,9 @@ def format_dataset_context(datasets: dict, query_sectors: list) -> tuple[str, di
         for key in matched_keys:
             if key in datasets:
                 source_label = "RBI" if key.startswith(("economy", "agriculture", "infrastructure")) else \
-                                "UDISE+" if key.startswith("education") else "NFHS-5"
+                                "UDISE+" if key.startswith("education") else \
+                                "RBI/NITI Aayog MPI" if key == "health_mpi_all_states" else \
+                                "NITI Aayog Health Index" if key == "health_niti_index" else "NFHS-5"
                 context_parts.append(f"\n=== INDIA {query_sector.upper()} DATA ({source_label}) ===\n{datasets[key][:2500]}")
                 found_any = True
         grounded[query_sector.lower()] = found_any
