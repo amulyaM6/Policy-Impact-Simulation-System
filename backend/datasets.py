@@ -87,8 +87,9 @@ def format_dataset_context(datasets: dict, query_sectors: list) -> tuple[str, di
                                 "UDISE+" if key.startswith("education") else \
                                 "RBI/NITI Aayog MPI" if key == "health_mpi_all_states" else \
                                 "NITI Aayog Health Index" if key == "health_niti_index" else "NFHS-5"
-                context_parts.append(f"\n=== INDIA {query_sector.upper()} DATA ({source_label}) ===\n{datasets[key][:2500]}")
+                context_parts.append(f"\n=== INDIA {query_sector.upper()} DATA ({source_label}) ===\n{datasets[key][:900]}")
                 found_any = True
+                break  # one real source per sector is enough — stacking multiple just burns tokens
         grounded[query_sector.lower()] = found_any
 
     return "\n".join(context_parts), grounded

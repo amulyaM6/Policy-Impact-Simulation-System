@@ -4,6 +4,8 @@ from groq import Groq
 import os
 import io
 import json
+import time
+import uuid
 import PyPDF2
 import docx
 from dotenv import load_dotenv
@@ -24,6 +26,27 @@ app.add_middleware(
 )
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+
+def _groq_create(retries: int = 3, **kwargs):
+    """Wraps client.chat.completions.create with automatic retry on Groq's
+    429 (rate limit) response. Groq's free tier caps tokens-per-minute, and
+    this app sometimes makes 2 calls back-to-back (classifier + analysis)
+    that together can briefly exceed it. Groq's error message includes the
+    exact wait time needed, so we back off a little longer than that and
+    try again rather than failing the whole upload."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "rate_limit_exceeded" in msg or "429" in msg:
+                last_error = e
+                time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s backoff
+                continue
+            raise
+    raise last_error
 
 # All 28 Indian states (matches the paper's "all 28 states" claim — this used
 # to be a hardcoded example list of 7 states, so most of the map defaulted
@@ -143,7 +166,7 @@ Policy document (relevant excerpts):
 {policy_text}
 """
 
-    return _call_groq_json(prompt, max_tokens=3200)
+    return _call_groq_json(prompt, max_tokens=2200)
 
 
 def _call_groq_json(prompt: str, max_tokens: int = 2000, retries: int = 1) -> dict:
@@ -155,7 +178,7 @@ def _call_groq_json(prompt: str, max_tokens: int = 2000, retries: int = 1) -> di
     attempt_prompt = prompt
 
     for attempt in range(retries + 1):
-        response = client.chat.completions.create(
+        response = _groq_create(
             model="openai/gpt-oss-120b",
             max_tokens=max_tokens,
             messages=[
@@ -216,7 +239,7 @@ async def upload_policy(file: UploadFile = File(...)):
             return {"error": "Could not extract text from this file. It may be a scanned image or blank document. Please upload a text-based PDF or DOCX."}
 
         # ── Check if it's actually a government policy ──
-        check_response = client.chat.completions.create(
+        check_response = _groq_create(
             model="openai/gpt-oss-120b",
             max_tokens=10,
             messages=[
@@ -237,12 +260,15 @@ async def upload_policy(file: UploadFile = File(...)):
             return {"error": "This does not appear to be a government policy document. Please upload a policy, bill, act, scheme, or official government document."}
 
         # ── RAG: chunk, embed, store, retrieve ──
-        build_rag(text, collection_name="policy")
+        # Unique collection per upload — prevents any possibility of a
+        # previous upload's data bleeding into this one (see rag.py notes)
+        collection_id = f"policy_{uuid.uuid4().hex[:12]}"
+        build_rag(text, collection_name=collection_id)
 
-        sector_context = retrieve_chunks("sector impact risk economy agriculture healthcare infrastructure education", "policy")
-        state_context = retrieve_chunks("state wise impact india punjab maharashtra kerala uttar pradesh gujarat", "policy")
-        stakeholder_context = retrieve_chunks("stakeholders affected groups people farmers organizations government", "policy")
-        timeline_context = retrieve_chunks("timeline short term long term future impact years months", "policy")
+        sector_context = retrieve_chunks("sector impact risk economy agriculture healthcare infrastructure education", collection_id)
+        state_context = retrieve_chunks("state wise impact india punjab maharashtra kerala uttar pradesh gujarat", collection_id)
+        stakeholder_context = retrieve_chunks("stakeholders affected groups people farmers organizations government", collection_id)
+        timeline_context = retrieve_chunks("timeline short term long term future impact years months", collection_id)
 
         # ── Fetch real RBI dataset context ──
         sector_names = ["agriculture", "economy", "infrastructure", "healthcare", "education"]
@@ -312,11 +338,13 @@ async def compare_policies(
         text2 = extract_text(bytes2, file2.filename)
 
         # ── RAG for both policies ──
-        build_rag(text1, collection_name="policy1")
-        build_rag(text2, collection_name="policy2")
+        collection_id1 = f"policy1_{uuid.uuid4().hex[:12]}"
+        collection_id2 = f"policy2_{uuid.uuid4().hex[:12]}"
+        build_rag(text1, collection_name=collection_id1)
+        build_rag(text2, collection_name=collection_id2)
 
-        context1 = retrieve_chunks("sector economy agriculture healthcare infrastructure impact", "policy1")
-        context2 = retrieve_chunks("sector economy agriculture healthcare infrastructure impact", "policy2")
+        context1 = retrieve_chunks("sector economy agriculture healthcare infrastructure impact", collection_id1)
+        context2 = retrieve_chunks("sector economy agriculture healthcare infrastructure impact", collection_id2)
 
         # ── Fetch real RBI dataset context for comparison ──
         dataset_context, _ = get_sector_context(["agriculture", "economy", "infrastructure", "healthcare", "education"])
