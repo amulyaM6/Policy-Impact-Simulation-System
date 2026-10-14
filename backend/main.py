@@ -11,11 +11,11 @@ import docx
 from dotenv import load_dotenv
 from rag import build_rag, retrieve_chunks
 from datasets import get_sector_context
-from risk_engine import compute_risk_score
+from risk_engine import compute_risk_score, WEIGHTS
 from simulation import simulate_timeline
-from ml_engine import run_ml_predictions
 from monte_carlo import run_monte_carlo
 from monte_carlo_api import router as monte_carlo_router
+from risk_ensemble import rate_risk_dimensions
 
 load_dotenv()
 
@@ -79,16 +79,14 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 # ── Send RAG context to Groq for analysis ──
 #
-# IMPORTANT CHANGE: the LLM is no longer asked to invent the final
-# overall_risk_score directly. It's asked to estimate the four underlying
-# risk *dimensions* (severity, plausibility, magnitude, vulnerable
-# population) from the policy text, and the actual score is computed in
-# Python by risk_engine.compute_risk_score() using a fixed, documented
-# formula. This matches the abstract's claim that "the risk score is
-# assigned depending on the rules assigned to it" — previously that wasn't
-# true, the LLM was just outputting a number with no rule behind it.
+# The four risk dimensions (severity, plausibility, magnitude, vulnerable
+# population) are NOT requested here any more. They are rated separately by
+# risk_ensemble.rate_risk_dimensions(): three raters use one written rubric,
+# must quote evidence from the policy (verified in code), and the median is
+# taken. The overall score is then computed in Python by
+# risk_engine.compute_risk_score() using a fixed, documented formula.
 #
-# The timeline is also no longer LLM-invented — see simulate_timeline() in
+# The timeline is not LLM-invented either — see simulate_timeline() in
 # simulation.py, called after this function returns.
 #
 # NOTE: this prompt is an f-string, so every literal { or } in the JSON
@@ -96,7 +94,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 # {states_list_example} or {policy_text} use single braces.
 def analyse_with_groq(policy_text: str) -> dict:
     states_list_example = ",\n    ".join(
-        f'{{"state": "{s}", "impact_score": 0}}' for s in INDIAN_STATES[:3]
+        f'{{"state": "{s}", "impact_score": "<0-100>"}}' for s in INDIAN_STATES[:3]
     )
 
     prompt = f"""
@@ -110,18 +108,12 @@ Analyse this policy document and return ONLY a JSON object with this exact struc
     "stage1_before": "Detailed 2-3 sentence story describing the societal problems and challenges BEFORE this policy is implemented.",
     "stage2_after": "Detailed 2-3 sentence story describing the outcomes, changes, and unintended consequences AFTER this policy is implemented."
   }},
-  "risk_dimensions": {{
-    "severity": 65,
-    "plausibility": 60,
-    "magnitude": 70,
-    "vulnerable_population": 55
-  }},
   "sectors": [
-    {{"name": "Agriculture", "score": 80, "sentiment": "negative"}},
-    {{"name": "Economy", "score": 55, "sentiment": "neutral"}},
-    {{"name": "Healthcare", "score": 30, "sentiment": "positive"}},
-    {{"name": "Education", "score": 45, "sentiment": "neutral"}},
-    {{"name": "Infrastructure", "score": 60, "sentiment": "negative"}}
+    {{"name": "Agriculture", "score": "<0-100>", "sentiment": "<positive|negative|neutral>"}},
+    {{"name": "Economy", "score": "<0-100>", "sentiment": "<positive|negative|neutral>"}},
+    {{"name": "Healthcare", "score": "<0-100>", "sentiment": "<positive|negative|neutral>"}},
+    {{"name": "Education", "score": "<0-100>", "sentiment": "<positive|negative|neutral>"}},
+    {{"name": "Infrastructure", "score": "<0-100>", "sentiment": "<positive|negative|neutral>"}}
   ],
   "states": [
     {states_list_example},
@@ -162,12 +154,7 @@ Analyse this policy document and return ONLY a JSON object with this exact struc
 }}
 
 Score rules:
-- risk_dimensions: each 0 to 100. These are the ONLY risk inputs you provide —
-  do NOT compute an overall score yourself, the backend computes it from these.
-  - severity: how bad are the negative side-effects if they occur?
-  - plausibility: how likely are those effects to actually happen?
-  - magnitude: how many people / how much of the economy is affected?
-  - vulnerable_population: how directly does it hit vulnerable groups?
+- Do NOT provide any overall risk score or risk dimensions; the backend computes those separately.
 - sector scores: 0 to 100
 - sentiment: only "positive", "negative", or "neutral"
 - severity (stakeholders): only "high", "medium", or "low"
@@ -196,6 +183,7 @@ def _call_groq_json(prompt: str, max_tokens: int = 2000, retries: int = 1) -> di
     for attempt in range(retries + 1):
         response = _groq_create(
             model="openai/gpt-oss-120b",
+            temperature=0,
             max_tokens=max_tokens,
             messages=[
                 {
@@ -309,8 +297,17 @@ REAL INDIA REFERENCE DATA (RBI Handbook of Statistics):
 
         result = analyse_with_groq(rag_context)
 
+        # ── Multi-LLM ensemble rates the four risk dimensions ──
+        # Three raters, one written rubric, evidence quotes verified against
+        # the full policy text, median per dimension (see risk_ensemble.py).
+        ensemble = rate_risk_dimensions(rag_context, text, _groq_create)
+        result["risk_dimensions"] = ensemble["risk_dimensions"]
+        result["risk_dimension_details"] = ensemble["details"]
+        result["risk_confidence"] = ensemble["confidence"]
+        result["risk_models_used"] = ensemble["models_used"]
+
         # ── Compute the overall risk score with the rule-based engine ──
-        # (the LLM only supplied the four input dimensions above)
+        # (the ensemble supplied the four input dimensions above)
         risk = compute_risk_score(result.get("risk_dimensions", {}))
         result["overall_risk_score"] = risk["overall_risk_score"]
         result["risk_level"] = risk["risk_level"]
@@ -322,22 +319,20 @@ REAL INDIA REFERENCE DATA (RBI Handbook of Statistics):
         for sector in result.get("sectors", []):
             sector["data_grounded"] = data_grounded.get(sector.get("name", "").lower(), False)
 
-        # ── Run Hybrid ML Engine (XGBoost + LSTM + SHAP) ──
-        ml_results = run_ml_predictions(result["overall_risk_score"])
-        result["shap_importance"] = ml_results["shap_importance"]
-        result["xgboost_prediction"] = ml_results["xgboost_prediction"]
-
-        # ── Timeline: always the deterministic decay-model simulation ──
-        # (the prompt no longer asks the LLM for a timeline, so the old
-        # "if not result.get('timeline')" check always fell through to the
-        # LSTM and simulate_timeline was never used). Using the decay model
-        # keeps the timeline chart consistent with the Monte Carlo fan,
-        # which samples the very same model.
+        # ── Timeline: the deterministic stakeholder-adaptation decay model ──
+        # (not LLM-generated). Using the same model as the Monte Carlo fan
+        # keeps the timeline chart consistent with it.
         result["timeline"] = simulate_timeline(
             result["overall_risk_score"], result.get("stakeholders", [])
         )
-        # The ML engine's timeline is kept as a separate field.
-        result["lstm_timeline"] = ml_results["lstm_timeline"]
+
+        # ── Explainability: exact contribution of each risk dimension ──
+        # score = sum(weight x rating), so each term IS that dimension's
+        # exact contribution to the overall score (no trained model needed).
+        result["risk_contributions"] = {
+            k: round(v * WEIGHTS.get(k, 0), 1)
+            for k, v in result["risk_dimensions"].items()
+        }
 
         # ── Real Monte Carlo: propagate uncertainty in the risk dimensions,
         # stakeholder adaptability and model structure (see monte_carlo.py) ──
