@@ -17,6 +17,10 @@ inputs gives the same curve.
 """
 
 import math
+import numpy as np
+EQUILIBRIUM_FACTOR = 0.55   # share of friction that adaptation can remove (at adaptability = 1)
+DECAY_BASE = 0.15           # per-year decay with zero adaptability
+DECAY_SLOPE = 0.50          # extra per-year decay per unit of adaptability
 
 ADAPTABILITY_PRIORS = {
     "farmer": 0.25,
@@ -71,6 +75,22 @@ def _weighted_adaptability(stakeholders: list) -> float:
         return DEFAULT_ADAPTABILITY
     return weighted_sum / total_weight
 
+def trajectory(base, adaptability, t, eq_factor=EQUILIBRIUM_FACTOR,
+               decay_base=DECAY_BASE, decay_slope=DECAY_SLOPE):
+    """Impact score at time t (years). Works on scalars or numpy arrays."""
+    equilibrium = base * (1 - eq_factor * adaptability)
+    decay_rate = decay_base + decay_slope * adaptability
+    return equilibrium + (base - equilibrium) * np.exp(-decay_rate * t)
+
+
+def stakeholder_arrays(stakeholders: list):
+    """(adaptability priors, severity weights) as arrays, one per group."""
+    if not stakeholders:
+        return np.array([DEFAULT_ADAPTABILITY]), np.array([1.0])
+    priors = np.array([_agent_adaptability(str(s.get("group", ""))) for s in stakeholders])
+    weights = np.array([SEVERITY_WEIGHT.get(str(s.get("severity", "medium")).lower(), 0.6)
+                        for s in stakeholders])
+    return priors, weights
 
 def simulate_timeline(base_risk_score: float, stakeholders: list) -> list:
     """
@@ -80,12 +100,11 @@ def simulate_timeline(base_risk_score: float, stakeholders: list) -> list:
     """
     adaptability = _weighted_adaptability(stakeholders)
 
-    equilibrium = base_risk_score * (1 - 0.55 * adaptability)
-    decay_rate = 0.15 + 0.5 * adaptability  # per-year
+    equilibrium = base_risk_score * (1 - EQUILIBRIUM_FACTOR * adaptability)
 
     timeline = []
     for period_label, t in PERIODS:
-        score = equilibrium + (base_risk_score - equilibrium) * math.exp(-decay_rate * t)
+        score = float(trajectory(base_risk_score, adaptability, t))
         score = round(max(0, min(100, score)))
 
         pct_resolved = round(100 * (1 - (score - equilibrium) / (base_risk_score - equilibrium))) \

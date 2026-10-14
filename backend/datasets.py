@@ -14,6 +14,7 @@ DATASET_MAP = {
     "UDISE_": "education_udise",
     "RBI_health_MPI": "health_mpi_all_states",
     "NFHS5_": "health_nfhs_partial",
+    "NFHS_": "health_nfhs_partial",
     "NITI_Aayog_Health": "health_niti_index",
 }
 

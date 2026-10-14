@@ -13,6 +13,9 @@ from rag import build_rag, retrieve_chunks
 from datasets import get_sector_context
 from risk_engine import compute_risk_score
 from simulation import simulate_timeline
+from ml_engine import run_ml_predictions
+from monte_carlo import run_monte_carlo
+from monte_carlo_api import router as monte_carlo_router
 
 load_dotenv()
 
@@ -24,6 +27,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(monte_carlo_router)
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
@@ -64,7 +68,9 @@ INDIAN_STATES = [
 def extract_text(file_bytes: bytes, filename: str) -> str:
     if filename.endswith(".pdf"):
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        return " ".join(page.extract_text() for page in reader.pages)
+        # `or ""` — extract_text() returns None for pages without a text
+        # layer (e.g. scanned pages), which used to crash the join.
+        return " ".join((page.extract_text() or "") for page in reader.pages)
     elif filename.endswith(".docx"):
         doc = docx.Document(io.BytesIO(file_bytes))
         return " ".join(p.text for p in doc.paragraphs)
@@ -84,6 +90,10 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 #
 # The timeline is also no longer LLM-invented — see simulate_timeline() in
 # simulation.py, called after this function returns.
+#
+# NOTE: this prompt is an f-string, so every literal { or } in the JSON
+# example below MUST be doubled ({{ and }}). Only real placeholders such as
+# {states_list_example} or {policy_text} use single braces.
 def analyse_with_groq(policy_text: str) -> dict:
     states_list_example = ",\n    ".join(
         f'{{"state": "{s}", "impact_score": 0}}' for s in INDIAN_STATES[:3]
@@ -96,6 +106,10 @@ Analyse this policy document and return ONLY a JSON object with this exact struc
 
 {{
   "policy_title": "title of the policy",
+  "two_stage_scenario": {{
+    "stage1_before": "Detailed 2-3 sentence story describing the societal problems and challenges BEFORE this policy is implemented.",
+    "stage2_after": "Detailed 2-3 sentence story describing the outcomes, changes, and unintended consequences AFTER this policy is implemented."
+  }},
   "risk_dimensions": {{
     "severity": 65,
     "plausibility": 60,
@@ -166,7 +180,9 @@ Policy document (relevant excerpts):
 {policy_text}
 """
 
-    return _call_groq_json(prompt, max_tokens=2200)
+    # 3200 (was 2200): the added two_stage_scenario text makes the JSON
+    # longer, and a truncated response fails JSON parsing.
+    return _call_groq_json(prompt, max_tokens=3200)
 
 
 def _call_groq_json(prompt: str, max_tokens: int = 2000, retries: int = 1) -> dict:
@@ -306,13 +322,30 @@ REAL INDIA REFERENCE DATA (RBI Handbook of Statistics):
         for sector in result.get("sectors", []):
             sector["data_grounded"] = data_grounded.get(sector.get("name", "").lower(), False)
 
-        # ── Compute the timeline with the lightweight agent-based
-        # simulation instead of letting the LLM invent it ──
+        # ── Run Hybrid ML Engine (XGBoost + LSTM + SHAP) ──
+        ml_results = run_ml_predictions(result["overall_risk_score"])
+        result["shap_importance"] = ml_results["shap_importance"]
+        result["xgboost_prediction"] = ml_results["xgboost_prediction"]
+
+        # ── Timeline: always the deterministic decay-model simulation ──
+        # (the prompt no longer asks the LLM for a timeline, so the old
+        # "if not result.get('timeline')" check always fell through to the
+        # LSTM and simulate_timeline was never used). Using the decay model
+        # keeps the timeline chart consistent with the Monte Carlo fan,
+        # which samples the very same model.
         result["timeline"] = simulate_timeline(
             result["overall_risk_score"], result.get("stakeholders", [])
         )
+        # The ML engine's timeline is kept as a separate field.
+        result["lstm_timeline"] = ml_results["lstm_timeline"]
 
-        result["id"] = "sim_001"
+        # ── Real Monte Carlo: propagate uncertainty in the risk dimensions,
+        # stakeholder adaptability and model structure (see monte_carlo.py) ──
+        result["monte_carlo"] = run_monte_carlo(
+            result["risk_dimensions"], result.get("stakeholders", [])
+        )
+
+        result["id"] = f"sim_{uuid.uuid4().hex[:6]}"
         return result
 
     except Exception as e:

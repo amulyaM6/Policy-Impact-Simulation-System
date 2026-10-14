@@ -36,6 +36,52 @@ export interface TimelinePoint {
   description: string
 }
 
+export interface FanPoint {
+  t_years: number
+  label: string
+  mean: number
+  p5: number
+  p10: number
+  p25: number
+  p50: number
+  p75: number
+  p90: number
+  p95: number
+}
+
+export interface MonteCarloResult {
+  n_trials: number
+  seed: number
+  risk_score: {
+    mean: number
+    std: number
+    p5: number
+    p10: number
+    p50: number
+    p90: number
+    p95: number
+    histogram: { bin_start: number; bin_end: number; share: number }[]
+  }
+  probabilities: {
+    high_risk_now: number
+    medium_or_worse_now: number
+    high_impact_at_3y: number
+    medium_or_worse_at_3y: number
+    high_impact_at_5y: number
+    medium_or_worse_at_5y: number
+  }
+  worst_case_95: { now: number; at_3y: number; at_5y: number }
+  fan: FanPoint[]
+  sensitivity: { input: string; correlation: number }[]
+  assumptions: {
+    method: string
+    risk_dimension_sigma: number
+    risk_dimension_correlation: number
+    adaptability_sigma: number
+    model_structure_rel_sigma: number
+  }
+}
+
 export interface SimulationResult {
   id: string
   policy_title: string
@@ -48,6 +94,7 @@ export interface SimulationResult {
   stakeholders: Stakeholder[]
   recommendations: Recommendation[]
   timeline: TimelinePoint[]
+  monte_carlo?: MonteCarloResult
 }
 
 export interface SectorComparison {

@@ -13,9 +13,10 @@ import ExportButton from '@/components/ExportButton'
 import TimelineChart from '@/components/TimelineChart'
 import IndiaMap from '@/components/IndiaMap'
 import RiskBreakdown from '@/components/RiskBreakdown'
+import MonteCarloFanChart from '@/components/MonteCarloFanChart'
+import { runMonteCarlo } from '@/lib/api'
 import {
   PlusCircle,
-  Sparkles,
   LayoutGrid,
   BarChart2,
   MapPin,
@@ -24,15 +25,18 @@ import {
   FileCheck2,
   AlertCircle,
   Search,
-  Filter
 } from 'lucide-react'
+
+type TabId = 'overview' | 'sectors' | 'regional' | 'timeline' | 'recommendations'
 
 export default function Dashboard() {
   const [data, setData] = useState<SimulationResult>(mockData)
   const [isReal, setIsReal] = useState(false)
-  const [activeTab, setActiveTab] = useState<'overview' | 'sectors' | 'regional' | 'timeline' | 'recommendations'>('overview')
+  const [activeTab, setActiveTab] = useState<TabId>('overview')
   const [searchQuery, setSearchQuery] = useState('')
+  const [mcError, setMcError] = useState(false)
 
+   /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const stored = localStorage.getItem('simulationResult')
     if (stored) {
@@ -44,8 +48,32 @@ export default function Dashboard() {
       }
     }
   }, [])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
-  const filteredStates = data.states.filter(s =>
+  // Older stored results (and the demo data) have no Monte Carlo block, so
+  // request one from the backend. On failure a notice is shown instead.
+  useEffect(() => {
+    if (data.monte_carlo || !data.risk_dimensions) return
+    let cancelled = false
+    runMonteCarlo(data.risk_dimensions, data.stakeholders)
+      .then((mc) => {
+        if (!cancelled) setData((d) => ({ ...d, monte_carlo: mc }))
+      })
+      .catch(() => {
+        if (!cancelled) setMcError(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [data.monte_carlo, data.risk_dimensions, data.stakeholders])
+
+  const rerunMonteCarlo = async (nTrials: number) => {
+    if (!data.risk_dimensions) return
+    const mc = await runMonteCarlo(data.risk_dimensions, data.stakeholders, nTrials)
+    setData((d) => ({ ...d, monte_carlo: mc }))
+  }
+
+  const filteredStates = data.states.filter((s) =>
     s.state.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
@@ -91,7 +119,14 @@ export default function Dashboard() {
             <p className="text-slate-400 font-mono text-xs flex items-center gap-2">
               <span>Simulation Hash: <strong className="text-slate-600">{data.id}</strong></span>
               <span>•</span>
-              <span>Iterations: <strong className="text-indigo-600">10,000 Monte Carlo</strong></span>
+              <span>
+                Iterations:{' '}
+                <strong className="text-indigo-600">
+                  {data.monte_carlo
+                    ? `${data.monte_carlo.n_trials.toLocaleString()} Monte Carlo runs`
+                    : 'Monte Carlo pending'}
+                </strong>
+              </span>
             </p>
           </div>
 
@@ -119,7 +154,7 @@ export default function Dashboard() {
             return (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
+                onClick={() => setActiveTab(tab.id)}
                 className={`relative flex items-center gap-2 px-5 py-2.5 rounded-2xl text-xs font-extrabold transition-all shrink-0 ${
                   isActive
                     ? 'text-indigo-600 bg-white shadow-md shadow-slate-900/5 border border-slate-200/90'
@@ -277,6 +312,17 @@ export default function Dashboard() {
               className="space-y-6"
             >
               {data.timeline && <TimelineChart timeline={data.timeline} />}
+              {data.monte_carlo ? (
+                <MonteCarloFanChart data={data.monte_carlo} onRerun={rerunMonteCarlo} />
+              ) : (
+                <div className="bg-white/90 border border-slate-200/80 rounded-2xl p-6 text-sm text-slate-500">
+                  {mcError
+                    ? 'Monte Carlo analysis unavailable: could not reach the backend /simulate endpoint.'
+                    : data.risk_dimensions
+                      ? 'Running Monte Carlo simulation…'
+                      : 'Upload a policy to run the Monte Carlo analysis.'}
+                </div>
+              )}
             </motion.div>
           )}
 
